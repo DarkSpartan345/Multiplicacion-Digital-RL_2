@@ -1,0 +1,31 @@
+{
+  "best_reward": -4.686098098754883,
+  "final_nodes": 5001,
+  "final_depth": 5,
+  "final_branching_factor": 3.620564808110065,
+  "iterations": 5000,
+  "c_exploration": 2.0,
+  "c_final": 1.9601,
+  "c_min": 0.5,
+  "c_max": 4.0,
+  "n_rollouts": 32,
+  "C_pw": 2.0,
+  "alpha": 0.5,
+  "gamma": 0.0,
+  "rave_k": 500.0,
+  "reward_window": 100,
+  "reward_threshold": 0.005,
+  "effective_alpha_by_depth": {
+    "0": 0.5,
+    "4": 0.5,
+    "8": 0.5,
+    "16": 0.5,
+    "24": 0.5,
+    "32": 0.5
+  },
+  "bits": 4,
+  "height": 4,
+  "CC": 32,
+  "n_actions": 66,
+  "elapsed_time_s": 210.46
+}

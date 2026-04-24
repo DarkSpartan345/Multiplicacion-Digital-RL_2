@@ -1,0 +1,9 @@
+{
+  "best_reward": -0.9148967862129211,
+  "final_nodes": 10001,
+  "final_depth": 5,
+  "iterations": 10000,
+  "c_exploration": 5.0,
+  "bits": 2,
+  "height": 2
+}

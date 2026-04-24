@@ -1,0 +1,16 @@
+{
+  "best_reward": -4.641729831695557,
+  "final_nodes": 10001,
+  "final_depth": 9,
+  "final_branching_factor": 1.918649270913277,
+  "iterations": 10000,
+  "c_exploration": 1.0,
+  "n_rollouts": 32,
+  "C_pw": 1.7,
+  "alpha": 0.1,
+  "bits": 4,
+  "height": 4,
+  "CC": 32,
+  "n_actions": 66,
+  "elapsed_time_s": 282.23
+}

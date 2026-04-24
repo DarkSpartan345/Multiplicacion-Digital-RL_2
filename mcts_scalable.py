@@ -66,21 +66,24 @@ class MCTSNodePW:
       visits=100 -> max 20 hijos
       visits=1089 -> max 66 hijos (todas las acciones para Bits=4)
     """
-    __slots__ = ['parent', 'action', 'depth', 'C_pw', 'alpha',
+    __slots__ = ['parent', 'action', 'depth', 'C_pw', 'alpha', 'gamma',
                  'children', 'visits', 'reward_sum', 'untried_actions',
-                 'cached_state']
+                 'cached_state', 'amaf_sum', 'amaf_visits']
 
-    def __init__(self, parent=None, action=None, depth=0, C_pw=2.0, alpha=0.5):
+    def __init__(self, parent=None, action=None, depth=0, C_pw=2.0, alpha=0.5, gamma=0.0, rave_k=500):
         self.parent = parent
         self.action = action
         self.depth = depth
         self.C_pw = C_pw
         self.alpha = alpha
+        self.gamma = gamma
         self.children = {}
         self.visits = 0
         self.reward_sum = 0.0
         self.untried_actions = None
         self.cached_state = None
+        self.amaf_sum = {}      # action -> sum of rewards where action appeared
+        self.amaf_visits = {}   # action -> count of times action appeared
 
     def init_untried_actions(self, n_actions):
         if self.untried_actions is None:
@@ -90,7 +93,8 @@ class MCTSNodePW:
     def max_children_allowed(self):
         if self.visits <= 0:
             return 1
-        return max(1, int(math.ceil(self.C_pw * (self.visits ** self.alpha))))
+        effective_alpha = self.alpha / (1 + self.gamma * self.depth)
+        return max(1, int(math.ceil(self.C_pw * (self.visits ** effective_alpha))))
 
     def should_expand(self):
         """True si el nodo debe expandir un hijo nuevo (progressive widening).
@@ -112,9 +116,28 @@ class MCTSNodePW:
         explore = c * math.sqrt(math.log(self.parent.visits) / (1 + self.visits))
         return exploit + explore
 
-    def best_child(self, c=1.41):
+    def uct_value_rave(self, c=1.41, rave_k=500):
+        if self.visits == 0:
+            return float('inf')
+        exploit = self.reward_sum / self.visits
+        if self.parent is None or self.parent.visits == 0:
+            return exploit
+        explore = c * math.sqrt(math.log(self.parent.visits) / (1 + self.visits))
+        uct = exploit + explore
+        # RAVE: blend with AMAF estimate if available
+        if self.action is not None and self.action in self.parent.amaf_visits:
+            amaf_visits_count = self.parent.amaf_visits[self.action]
+            if amaf_visits_count > 0:
+                q_amaf = self.parent.amaf_sum[self.action] / amaf_visits_count
+                beta = math.sqrt(rave_k / (3 * self.parent.visits + rave_k))
+                return (1 - beta) * uct + beta * q_amaf
+        return uct
+
+    def best_child(self, c=1.41, rave=False, rave_k=500):
         if not self.children:
             return None
+        if rave:
+            return max(self.children.values(), key=lambda ch: ch.uct_value_rave(c, rave_k))
         return max(self.children.values(), key=lambda ch: ch.uct_value(c))
 
     def update(self, reward):
@@ -139,13 +162,21 @@ class MCTSScalable:
     """
 
     def __init__(self, env, n_iterations=10000, c=2.0, n_rollouts=32,
-                 C_pw=2.0, alpha=0.5, log_dir='./runs'):
+                 C_pw=2.0, alpha=0.5, gamma=0.3, rave_k=500, c_min=0.5, c_max=4.0,
+                 reward_window=100, reward_threshold=0.005, log_dir='./runs'):
         self.env = env
         self.n_iterations = n_iterations
         self.c = c
+        self.c_current = c
         self.n_rollouts = n_rollouts
         self.C_pw = C_pw
         self.alpha = alpha
+        self.gamma = gamma
+        self.rave_k = rave_k
+        self.c_min = c_min
+        self.c_max = c_max
+        self.reward_window = reward_window
+        self.reward_threshold = reward_threshold
 
         # Tensor pre-computado para restaurar estado a todos los slots
         self._rollout_idx = torch.arange(n_rollouts, device=env.device,
@@ -153,7 +184,7 @@ class MCTSScalable:
         self._slot0_idx = torch.tensor([0], device=env.device, dtype=torch.long)
 
         # Root
-        self.root = MCTSNodePW(C_pw=C_pw, alpha=alpha)
+        self.root = MCTSNodePW(C_pw=C_pw, alpha=alpha, gamma=gamma, rave_k=rave_k)
         self.root.init_untried_actions(env.n_actions)
         self.env.reset(list(range(n_rollouts)))
         self.root.cached_state = CachedState(env, slot=0)
@@ -165,11 +196,13 @@ class MCTSScalable:
         # TensorBoard
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         run_name = (f"mcts_pw_bits{env.Bits}_c{c:.2f}_"
-                    f"r{n_rollouts}_pw{C_pw}_{timestamp}")
+                    f"r{n_rollouts}_pw{C_pw}_g{gamma:.2f}_{timestamp}")
         self.writer = SummaryWriter(f'{log_dir}/{run_name}')
         print(f"\nTensorBoard: tensorboard --logdir {log_dir}")
         print(f"Run: {run_name}")
-        print(f"Progressive Widening: C_pw={C_pw}, alpha={alpha}")
+        print(f"Progressive Widening: C_pw={C_pw}, alpha={alpha}, gamma={gamma}")
+        print(f"RAVE/AMAF: rave_k={rave_k}")
+        print(f"c-adaptive: min={c_min}, max={c_max}, window={reward_window}, threshold={reward_threshold}")
         print(f"Parallel rollouts: {n_rollouts}")
         print(f"Search space: {env.n_actions}^{env.CC} "
               f"= {env.n_actions**min(env.CC, 20):.2e}{'...' if env.CC > 20 else ''}\n")
@@ -180,6 +213,7 @@ class MCTSScalable:
         self.best_policy = None
         self.best_reward_found = -float('inf')
         self.elapsed_time = 0.0
+        self.c_log_values = []
 
     # ── State management ────────────────────────────────────────────────
 
@@ -220,10 +254,12 @@ class MCTSScalable:
             mean_reward:  promedio de rewards finales (para backprop)
             best_reward:  mejor reward individual (para tracking)
             best_policy:  grid del mejor rollout (lista de strings)
+            best_actions: acciones del mejor rollout (para RAVE/AMAF)
         """
         self._restore_state_all(cached_state)
 
         remaining = self.env.CC - cached_state.cursor
+        rollout_actions = [[] for _ in range(self.n_rollouts)]
         for _ in range(remaining):
             active = ~self.env.done[:self.n_rollouts]
             if not active.any():
@@ -231,6 +267,10 @@ class MCTSScalable:
             actions = torch.randint(0, self.env.n_actions,
                                     (self.env.n_envs,),
                                     device=self.env.device)
+            # Track actions for best rollout
+            for i in range(self.n_rollouts):
+                if i < len(rollout_actions):
+                    rollout_actions[i].append(int(actions[i].item()))
             self.env.step(actions)
 
         rewards = self.env.rewards[:self.n_rollouts]
@@ -238,8 +278,9 @@ class MCTSScalable:
         best_idx = int(rewards.argmax().item())
         best_reward = rewards[best_idx].item()
         best_state = self.env.get_single_state(best_idx)
+        best_actions = rollout_actions[best_idx] if best_idx < len(rollout_actions) else []
 
-        return mean_reward, best_reward, best_state
+        return mean_reward, best_reward, best_state, best_actions
 
     # ── Tree statistics (incremental + periodic full scan) ──────────────
 
@@ -296,7 +337,7 @@ class MCTSScalable:
             while node.children and not node.cached_state.is_done:
                 if node.should_expand():
                     break
-                best = node.best_child(c=self.c)
+                best = node.best_child(c=self.c_current, rave=True, rave_k=self.rave_k)
                 if best is None:
                     break
                 path.append(best)
@@ -319,7 +360,7 @@ class MCTSScalable:
                 child = MCTSNodePW(
                     parent=node, action=action_idx,
                     depth=node.depth + 1,
-                    C_pw=self.C_pw, alpha=self.alpha)
+                    C_pw=self.C_pw, alpha=self.alpha, gamma=self.gamma, rave_k=self.rave_k)
                 child.cached_state = CachedState(self.env, slot=0)
 
                 if not done_val:
@@ -341,14 +382,19 @@ class MCTSScalable:
                 total_reward = node.cached_state.reward
                 rollout_best_reward = node.cached_state.reward
                 rollout_best_policy = None
+                rollout_best_actions = []
             else:
-                total_reward, rollout_best_reward, rollout_best_state = \
+                total_reward, rollout_best_reward, rollout_best_state, rollout_best_actions = \
                     self._parallel_rollout(node.cached_state)
                 rollout_best_policy = rollout_best_state['suma_grid']
 
-            # ── BACKPROPAGATION ─────────────────────────────────────
+            # ── BACKPROPAGATION con RAVE/AMAF ──────────────────────
             for n in path:
                 n.update(total_reward)
+                # RAVE: actualizar estadisticas AMAF para las acciones del rollout
+                for action in rollout_best_actions:
+                    n.amaf_sum[action] = n.amaf_sum.get(action, 0.0) + total_reward
+                    n.amaf_visits[action] = n.amaf_visits.get(action, 0) + 1
 
             # ── TRACK BEST ──────────────────────────────────────────
             self.iteration_rewards.append(total_reward)
@@ -359,6 +405,17 @@ class MCTSScalable:
                 self.best_reward_found = rollout_best_reward
                 if rollout_best_policy is not None:
                     self.best_policy = rollout_best_policy
+
+            # ── ADAPTIVE c (Reactive to reward) ──────────────────────
+            W = self.reward_window
+            if len(self.iteration_rewards) >= 2 * W:
+                recent = np.mean(self.iteration_rewards[-W:])
+                prev = np.mean(self.iteration_rewards[-2*W:-W])
+                if (recent - prev) > self.reward_threshold:  # mejorando -> exploit
+                    self.c_current = max(self.c_min, self.c_current * 0.95)
+                else:  # estancado -> explore
+                    self.c_current = min(self.c_max, self.c_current * 1.05)
+            self.c_log_values.append(self.c_current)
 
             # ── TENSORBOARD ─────────────────────────────────────────
             i = iteration + 1
@@ -381,6 +438,9 @@ class MCTSScalable:
                 self.writer.add_scalar('Tree/branching_factor', last_bf, i)
                 self.writer.add_scalar('Tree/avg_depth', last_avg_d, i)
 
+            # TensorBoard: parametros adaptativos
+            self.writer.add_scalar('Params/c_current', self.c_current, i)
+
             # ── LOG ─────────────────────────────────────────────────
             if i % log_interval == 0:
                 avg_recent = np.mean(self.iteration_rewards[-100:])
@@ -391,7 +451,8 @@ class MCTSScalable:
                     f"nodes={self._node_count:6d} "
                     f"depth={self._max_depth_seen} "
                     f"bf={last_bf:.2f} "
-                    f"sel_d={selection_depth}")
+                    f"sel_d={selection_depth} "
+                    f"c={self.c_current:.3f}")
 
         self.elapsed_time = time.time() - t_start
         print(f"\n  MCTS completado en {self.elapsed_time:.1f}s\n")
@@ -516,9 +577,20 @@ class MCTSScalable:
             'final_branching_factor': self._branching_factor(self.root),
             'iterations': self.n_iterations,
             'c_exploration': self.c,
+            'c_final': round(self.c_current, 4),
+            'c_min': self.c_min,
+            'c_max': self.c_max,
             'n_rollouts': self.n_rollouts,
             'C_pw': self.C_pw,
             'alpha': self.alpha,
+            'gamma': self.gamma,
+            'rave_k': self.rave_k,
+            'reward_window': self.reward_window,
+            'reward_threshold': self.reward_threshold,
+            'effective_alpha_by_depth': {
+                str(d): round(self.alpha / (1 + self.gamma * d), 4)
+                for d in [0, 4, 8, 16, 24, 32]
+            },
             'bits': self.env.Bits,
             'height': self.env.height,
             'CC': self.env.CC,
@@ -549,6 +621,18 @@ if __name__ == '__main__':
                         help='Coeficiente progressive widening (default: 2.0)')
     parser.add_argument('--alpha', type=float, default=0.5,
                         help='Exponente progressive widening (default: 0.5)')
+    parser.add_argument('--gamma', type=float, default=0.3,
+                        help='Decaimiento alpha por profundidad (default: 0.3)')
+    parser.add_argument('--rave-k', type=float, default=500,
+                        help='Hiperparametro RAVE para peso beta (default: 500)')
+    parser.add_argument('--c-min', type=float, default=0.5,
+                        help='c minimo en adaptacion reactiva (default: 0.5)')
+    parser.add_argument('--c-max', type=float, default=4.0,
+                        help='c maximo en adaptacion reactiva (default: 4.0)')
+    parser.add_argument('--reward-window', type=int, default=100,
+                        help='Ventana de iteraciones para adaptacion de c (default: 100)')
+    parser.add_argument('--reward-threshold', type=float, default=0.005,
+                        help='Umbral de mejora para adaptacion de c (default: 0.005)')
     parser.add_argument('--output', type=str,
                         default='./mcts_scalable_results',
                         help='Directorio de salida')
@@ -580,6 +664,12 @@ if __name__ == '__main__':
         n_rollouts=args.n_rollouts,
         C_pw=args.C_pw,
         alpha=args.alpha,
+        gamma=args.gamma,
+        rave_k=args.rave_k,
+        c_min=args.c_min,
+        c_max=args.c_max,
+        reward_window=args.reward_window,
+        reward_threshold=args.reward_threshold,
         log_dir=args.log_dir,
     )
     mcts.run()
